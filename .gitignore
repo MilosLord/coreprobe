@@ -1,0 +1,11 @@
+*.exe
+*.o
+*.obj
+*.log
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.json
+.vs/
+credentials.txt
