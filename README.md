@@ -4,6 +4,8 @@ Per-core FPU/SIMD correctness diagnostic for x86-64. Catches silicon defects tha
 
 Developed after discovering a Ryzen 9 5950X with a single core whose SIMD units produced incorrect results under quaternion math, causing Unreal Engine 5 `IsRotationNormalized()` assertion crashes that only appeared when the OS scheduler placed work on that specific core.
 
+![coreprobe detecting faulty SIMD units on a Ryzen 9 5950X](screenshot.png)
+
 ## Tests
 
 | Test | Instruction Path | What It Catches | Comparison |

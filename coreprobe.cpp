@@ -151,10 +151,10 @@ static TopologyInfo detect_topology(int max_threads) {
     int n = max_threads < MAX_THREADS ? max_threads : MAX_THREADS;
 
     for (int i = 0; i < n; i++) {
-        topo.physical_core[i] = i / 2;
+        topo.physical_core[i] = i;
         topo.package_id[i] = 0;
     }
-    topo.core_count = n / 2;
+    topo.core_count = n;
     topo.valid = false;
 
 #ifdef _WIN32
@@ -914,7 +914,7 @@ int main(int argc, char **argv) {
     printf("  Vendor:              %s\n", cpu.vendor);
     printf("  Logical processors:  %d\n", max_threads);
     printf("  Physical cores:      %d%s\n", topo.core_count,
-           topo.valid ? " (OS topology)" : " (heuristic -thread_id/2)");
+           topo.valid ? " (OS topology)" : " (heuristic — 1 thread per core)");
     printf("  Instruction sets:    SSE=%s  AVX2=%s  FMA3=%s\n",
            cpu.has_sse ? COL_GREEN "yes" COL_RESET : COL_RED "no" COL_RESET,
            cpu.has_avx2 ? COL_GREEN "yes" COL_RESET : COL_RED "no" COL_RESET,
