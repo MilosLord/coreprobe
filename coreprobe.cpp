@@ -3,7 +3,7 @@
  * https://github.com/MilosLord/coreprobe
  *
  * Detects faulty floating-point execution units by stress-testing quaternion
- * normalization across SCALAR, SSE, AVX2, FMA3, and cross-lane AVX2 (XLANE)
+ * normalization across SCALAR, SSE3, AVX2, FMA3, and cross-lane AVX2 (XLANE)
  * on each logical processor independently. Catches silicon defects that
  * memtest86+, Prime95, and WHEA miss.
  *
@@ -13,9 +13,14 @@
  * License: MIT
  */
 
-#define COREPROBE_VERSION "1.0"
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#define COREPROBE_VERSION "1.0.1"
 #define MAX_THREADS 4096
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -35,6 +40,17 @@
 #else
     #define COREPROBE_NO_OPTIMIZE
     #define COREPROBE_RESTORE_OPT
+#endif
+
+// Per-function ISA target attributes (GCC/Clang; MSVC uses global /arch:)
+#if defined(__GNUC__) || defined(__clang__)
+    #define TARGET_SSE3     __attribute__((target("sse3")))
+    #define TARGET_AVX2     __attribute__((target("avx2")))
+    #define TARGET_AVX2_FMA __attribute__((target("avx2,fma")))
+#else
+    #define TARGET_SSE3
+    #define TARGET_AVX2
+    #define TARGET_AVX2_FMA
 #endif
 
 // ============================================================================
@@ -72,8 +88,8 @@
         return true;
     }
 
-    static void platform_set_high_priority() {
-        SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    static bool platform_set_high_priority() {
+        return SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS) != 0;
     }
 
     static double now_sec() {
@@ -92,7 +108,6 @@
     }
 
 #else // Linux / POSIX
-    #define _GNU_SOURCE
     #include <pthread.h>
     #include <sched.h>
     #include <unistd.h>
@@ -120,8 +135,10 @@
         return true;
     }
 
-    static void platform_set_high_priority() {
+    static bool platform_set_high_priority() {
+        errno = 0;
         nice(-20);
+        return errno == 0;
     }
 
     static double now_sec() {
@@ -239,7 +256,7 @@ static TopologyInfo detect_topology(int max_threads) {
         if (f) {
             fscanf(f, "%d", &raw[i].pkg);
             fclose(f);
-        }
+        } else { ok = false; }
         topo.package_id[i] = raw[i].pkg;
     }
     if (ok) {
@@ -285,6 +302,7 @@ static TopologyInfo detect_topology(int max_threads) {
 
 struct CPUFeatures {
     bool has_sse;
+    bool has_sse3;
     bool has_avx2;
     bool has_fma3;
     bool os_avx_enabled;
@@ -331,6 +349,7 @@ static CPUFeatures detect_cpu() {
 
     cpuid(1, 0, r);
     f.has_sse        = (r[3] & (1 << 25)) != 0;
+    f.has_sse3       = (r[2] & (1 << 0)) != 0;
     bool has_osxsave = (r[2] & (1 << 27)) != 0;
     bool cpu_fma3    = (r[2] & (1 << 12)) != 0;
     bool cpu_avx     = (r[2] & (1 << 28)) != 0;
@@ -388,8 +407,8 @@ static const int    RERUN_COUNT = 3;
 static const double RERUN_DURATION = 1.0;
 static const uint64_t ITER_CHECK_FREQ = 0xFFFFF;
 
-enum TestType { T_SCALAR = 0, T_SSE, T_AVX2, T_FMA3, T_XLANE, NUM_TESTS };
-static const char *tname[NUM_TESTS] = { "SCALAR", "SSE", "AVX2", "FMA3", "XLANE" };
+enum TestType { T_SCALAR = 0, T_SSE3, T_AVX2, T_FMA3, T_XLANE, NUM_TESTS };
+static const char *tname[NUM_TESTS] = { "SCALAR", "SSE3", "AVX2", "FMA3", "XLANE" };
 
 struct TestResult {
     bool     passed;
@@ -434,8 +453,17 @@ static TestResult run_scalar(PRNG &rng, double deadline) {
     return r;
 }
 
-// SSE -128-bit SIMD
+// SSE3 helper - dot product for verification
+TARGET_SSE3
+static float sse3_dot4(__m128 v) {
+    __m128 sq2=_mm_mul_ps(v,v);
+    __m128 h1=_mm_hadd_ps(sq2,sq2), h2=_mm_hadd_ps(h1,h1);
+    volatile float c; _mm_store_ss((float*)&c,h2); return c;
+}
 
+// SSE3 -128-bit SIMD
+
+TARGET_SSE3
 static TestResult run_sse(PRNG &rng, double deadline) {
     TestResult r = {}; r.passed = true;
     for (uint64_t i = 1; ; i++) {
@@ -453,12 +481,7 @@ static TestResult run_sse(PRNG &rng, double deadline) {
         __m128 na = _mm_mul_ps(q, inv);
         __m128 nb = _mm_div_ps(q, _mm_sqrt_ps(lv));
 
-        auto dot4 = [](__m128 v) -> float {
-            __m128 sq2=_mm_mul_ps(v,v);
-            __m128 h1=_mm_hadd_ps(sq2,sq2), h2=_mm_hadd_ps(h1,h1);
-            volatile float c; _mm_store_ss((float*)&c,h2); return c;
-        };
-        double da = fabs((double)dot4(na)-1.0), db = fabs((double)dot4(nb)-1.0);
+        double da = fabs((double)sse3_dot4(na)-1.0), db = fabs((double)sse3_dot4(nb)-1.0);
         double worst = da>db?da:db;
         if (worst > r.worst_dev) r.worst_dev = worst;
         if (worst > TOLERANCE) {
@@ -475,6 +498,7 @@ static TestResult run_sse(PRNG &rng, double deadline) {
 
 // AVX2 -256-bit SIMD (two quaternions simultaneously)
 
+TARGET_AVX2
 static TestResult run_avx2(PRNG &rng, double deadline) {
     TestResult r = {}; r.passed = true;
     for (uint64_t i = 1; ; i++) {
@@ -513,8 +537,20 @@ static TestResult run_avx2(PRNG &rng, double deadline) {
     return r;
 }
 
+// FMA3 helper - dot product using fused multiply-add
+TARGET_AVX2_FMA
+static float fma3_check(__m128 n) {
+    volatile float v[4]; _mm_storeu_ps((float*)v,n);
+    __m128 a2=_mm_set1_ps((float)v[0]),b2=_mm_set1_ps((float)v[1]);
+    __m128 c2=_mm_set1_ps((float)v[2]),d2=_mm_set1_ps((float)v[3]);
+    __m128 r2=_mm_mul_ss(a2,a2);
+    r2=_mm_fmadd_ss(b2,b2,r2); r2=_mm_fmadd_ss(c2,c2,r2); r2=_mm_fmadd_ss(d2,d2,r2);
+    volatile float o; _mm_store_ss((float*)&o,r2); return o;
+}
+
 // FMA3 -fused multiply-add pipeline
 
+TARGET_AVX2_FMA
 static TestResult run_fma3(PRNG &rng, double deadline) {
     TestResult r = {}; r.passed = true;
     for (uint64_t i = 1; ; i++) {
@@ -536,15 +572,7 @@ static TestResult run_fma3(PRNG &rng, double deadline) {
         __m128 len=_mm_sqrt_ss(dot);
         __m128 nb=_mm_div_ps(q, _mm_shuffle_ps(len,len,0));
 
-        auto fcheck = [](__m128 n) -> float {
-            volatile float v[4]; _mm_storeu_ps((float*)v,n);
-            __m128 a2=_mm_set1_ps((float)v[0]),b2=_mm_set1_ps((float)v[1]);
-            __m128 c2=_mm_set1_ps((float)v[2]),d2=_mm_set1_ps((float)v[3]);
-            __m128 r2=_mm_mul_ss(a2,a2);
-            r2=_mm_fmadd_ss(b2,b2,r2); r2=_mm_fmadd_ss(c2,c2,r2); r2=_mm_fmadd_ss(d2,d2,r2);
-            volatile float o; _mm_store_ss((float*)&o,r2); return o;
-        };
-        double da=fabs((double)fcheck(na)-1.0), db=fabs((double)fcheck(nb)-1.0);
+        double da=fabs((double)fma3_check(na)-1.0), db=fabs((double)fma3_check(nb)-1.0);
         double worst=da>db?da:db;
         if (worst > r.worst_dev) r.worst_dev = worst;
         if (worst>TOLERANCE) {
@@ -561,6 +589,7 @@ static TestResult run_fma3(PRNG &rng, double deadline) {
 
 // XLANE - AVX2 cross-lane data integrity (bit-exact)
 
+TARGET_AVX2
 static TestResult run_xlane(PRNG &rng, double deadline) {
     TestResult r = {}; r.passed = true;
     for (uint64_t i = 1; ; i++) {
@@ -641,11 +670,7 @@ COREPROBE_RESTORE_OPT
 // ============================================================================
 
 static int parse_threads(int argc, char **argv, int *out, int max_threads) {
-    if (argc <= 2) {
-        for (int i = 0; i < max_threads && i < MAX_THREADS; i++) out[i] = i;
-        return max_threads < MAX_THREADS ? max_threads : MAX_THREADS;
-    }
-
+    bool seen[MAX_THREADS] = {};
     int count = 0;
     for (int a = 2; a < argc && count < MAX_THREADS; a++) {
         if (argv[a][0] == '-' && argv[a][1] == '-') {
@@ -657,12 +682,22 @@ static int parse_threads(int argc, char **argv, int *out, int max_threads) {
             int lo = atoi(argv[a]);
             int hi = atoi(dash + 1);
             for (int t = lo; t <= hi && count < MAX_THREADS; t++) {
-                if (t >= 0 && t < max_threads) out[count++] = t;
+                if (t >= 0 && t < max_threads && !seen[t]) {
+                    seen[t] = true;
+                    out[count++] = t;
+                }
             }
         } else {
             int t = atoi(argv[a]);
-            if (t >= 0 && t < max_threads) out[count++] = t;
+            if (t >= 0 && t < max_threads && !seen[t]) {
+                seen[t] = true;
+                out[count++] = t;
+            }
         }
+    }
+    if (count == 0) {
+        for (int i = 0; i < max_threads && i < MAX_THREADS; i++) out[i] = i;
+        return max_threads < MAX_THREADS ? max_threads : MAX_THREADS;
     }
     return count;
 }
@@ -691,6 +726,7 @@ static void write_json(const char *path, CPUFeatures &cpu, TopologyInfo &topo,
     fprintf(fp, "    \"brand\": \"%s\",\n", cpu.brand);
     fprintf(fp, "    \"vendor\": \"%s\",\n", cpu.vendor);
     fprintf(fp, "    \"has_sse\": %s,\n", cpu.has_sse ? "true" : "false");
+    fprintf(fp, "    \"has_sse3\": %s,\n", cpu.has_sse3 ? "true" : "false");
     fprintf(fp, "    \"has_avx2\": %s,\n", cpu.has_avx2 ? "true" : "false");
     fprintf(fp, "    \"has_fma3\": %s,\n", cpu.has_fma3 ? "true" : "false");
     fprintf(fp, "    \"os_avx_enabled\": %s\n", cpu.os_avx_enabled ? "true" : "false");
@@ -748,7 +784,7 @@ static void write_json(const char *path, CPUFeatures &cpu, TopologyInfo &topo,
 static void print_help(const char *argv0) {
     printf("\n");
     printf("  coreprobe v%s - Per-Core FPU/SIMD Correctness Diagnostic\n\n", COREPROBE_VERSION);
-    printf("  Stress-tests quaternion normalization across SCALAR, SSE, AVX2, FMA3\n");
+    printf("  Stress-tests quaternion normalization across SCALAR, SSE3, AVX2, FMA3\n");
     printf("  plus cross-lane AVX2 data integrity (XLANE) on each logical processor\n");
     printf("  to detect faulty floating-point and SIMD execution units.\n");
     printf("  Catches defects that memtest86+, Prime95, and WHEA reporting miss.\n\n");
@@ -880,19 +916,24 @@ int main(int argc, char **argv) {
     int thread_list[MAX_THREADS];
     int num_threads = parse_threads(argc, argv, thread_list, max_threads);
 
-    if (socket_filter >= 0 && topo.valid) {
-        int filtered[MAX_THREADS];
-        int nf = 0;
-        for (int i = 0; i < num_threads; i++) {
-            if (topo.package_id[thread_list[i]] == socket_filter)
-                filtered[nf++] = thread_list[i];
-        }
-        if (nf > 0) {
-            memcpy(thread_list, filtered, nf * sizeof(int));
-            num_threads = nf;
+    if (socket_filter >= 0) {
+        if (!topo.valid) {
+            printf(COL_YELLOW "  Warning: --socket %d requested but topology detection failed, "
+                   "testing all threads\n" COL_RESET, socket_filter);
         } else {
-            printf(COL_RED "  Error: no threads found for socket %d\n" COL_RESET, socket_filter);
-            return 1;
+            int filtered[MAX_THREADS];
+            int nf = 0;
+            for (int i = 0; i < num_threads; i++) {
+                if (topo.package_id[thread_list[i]] == socket_filter)
+                    filtered[nf++] = thread_list[i];
+            }
+            if (nf > 0) {
+                memcpy(thread_list, filtered, nf * sizeof(int));
+                num_threads = nf;
+            } else {
+                printf(COL_RED "  Error: no threads found for socket %d\n" COL_RESET, socket_filter);
+                return 1;
+            }
         }
     }
 
@@ -915,8 +956,8 @@ int main(int argc, char **argv) {
     printf("  Logical processors:  %d\n", max_threads);
     printf("  Physical cores:      %d%s\n", topo.core_count,
            topo.valid ? " (OS topology)" : " (heuristic — 1 thread per core)");
-    printf("  Instruction sets:    SSE=%s  AVX2=%s  FMA3=%s\n",
-           cpu.has_sse ? COL_GREEN "yes" COL_RESET : COL_RED "no" COL_RESET,
+    printf("  Instruction sets:    SSE3=%s  AVX2=%s  FMA3=%s\n",
+           cpu.has_sse3 ? COL_GREEN "yes" COL_RESET : COL_RED "no" COL_RESET,
            cpu.has_avx2 ? COL_GREEN "yes" COL_RESET : COL_RED "no" COL_RESET,
            cpu.has_fma3 ? COL_GREEN "yes" COL_RESET : COL_RED "no" COL_RESET);
     printf("  OS AVX state:        %s\n",
@@ -938,8 +979,10 @@ int main(int argc, char **argv) {
     printf("  Rerun on fail:       %dx (deterministic seed replay)\n", RERUN_COUNT);
     printf("  Compile flags:       -O0, volatile floats (correctness test, not throughput)\n");
 
-    platform_set_high_priority();
-    printf("  Priority:            " COL_GREEN "HIGH" COL_RESET "\n");
+    if (platform_set_high_priority())
+        printf("  Priority:            " COL_GREEN "HIGH" COL_RESET "\n");
+    else
+        printf("  Priority:            " COL_YELLOW "normal (needs elevated privileges)" COL_RESET "\n");
 
     if (!cpu.os_avx_enabled) {
         printf("  " COL_YELLOW "Warning: OS has not enabled AVX state (XGETBV XCR0 bits 1:2)." COL_RESET "\n");
@@ -949,11 +992,12 @@ int main(int argc, char **argv) {
         if (!cpu.has_avx2) printf("  " COL_YELLOW "Note: AVX2 not supported by CPU, test will be skipped" COL_RESET "\n");
         if (!cpu.has_fma3) printf("  " COL_YELLOW "Note: FMA3 not supported by CPU, test will be skipped" COL_RESET "\n");
     }
+    if (!cpu.has_sse3) printf("  " COL_YELLOW "Note: SSE3 not supported by CPU, test will be skipped" COL_RESET "\n");
 
     printf("\n");
 
     printf(COL_GRAY "  %-5s %-13s %-13s %-13s %-13s %-13s %s" COL_RESET "\n",
-           "THR", "SCALAR", "SSE", "AVX2", "FMA3", "XLANE", "STATUS");
+           "THR", "SCALAR", "SSE3", "AVX2", "FMA3", "XLANE", "STATUS");
     printf(COL_GRAY "  %-5s %-13s %-13s %-13s %-13s %-13s %s" COL_RESET "\n",
            "---", "--------", "--------", "--------", "--------", "--------", "------");
 
@@ -967,15 +1011,13 @@ int main(int argc, char **argv) {
             printf(COL_CYAN "\n  === Pass %d%s ===" COL_RESET "\n\n",
                    pass_number, until_fail ? " (until-fail mode)" : "");
             printf(COL_GRAY "  %-5s %-13s %-13s %-13s %-13s %-13s %s" COL_RESET "\n",
-                   "THR", "SCALAR", "SSE", "AVX2", "FMA3", "XLANE", "STATUS");
+                   "THR", "SCALAR", "SSE3", "AVX2", "FMA3", "XLANE", "STATUS");
             printf(COL_GRAY "  %-5s %-13s %-13s %-13s %-13s %-13s %s" COL_RESET "\n",
                    "---", "--------", "--------", "--------", "--------", "--------", "------");
         }
 
     CoreResult *all = new CoreResult[num_threads]();
     double wall_start = now_sec();
-
-    _mm256_zeroupper();
 
     for (int ci = 0; ci < num_threads; ci++) {
         int tid = thread_list[ci];
@@ -996,6 +1038,13 @@ int main(int argc, char **argv) {
         PRNG rng;
 
         for (int t = 0; t < NUM_TESTS; t++) {
+            if (t == T_SSE3 && !cpu.has_sse3) {
+                cr->tests[t].skipped = true;
+                cr->tests[t].passed = true;
+                printf(COL_GRAY "%-13s" COL_RESET, "skip");
+                fflush(stdout);
+                continue;
+            }
             if (t == T_AVX2 && !cpu.has_avx2) {
                 cr->tests[t].skipped = true;
                 cr->tests[t].passed = true;
@@ -1018,7 +1067,8 @@ int main(int argc, char **argv) {
                 continue;
             }
 
-            uint32_t seed = 0xF00D0000u + (uint32_t)tid * NUM_TESTS + (uint32_t)t;
+            uint32_t seed = 0xF00D0000u + ((uint32_t)pass << 20)
+                          + (uint32_t)tid * NUM_TESTS + (uint32_t)t;
             rng.seed(seed);
             double deadline = now_sec() + secs_per_test;
             cr->tests[t] = test_funcs[t](rng, deadline);
@@ -1041,8 +1091,9 @@ int main(int argc, char **argv) {
 
                 // Deterministic rerun to confirm
                 cr->tests[t].rerun_fails = 0;
+                double rerun_dur = secs_per_test > RERUN_DURATION ? secs_per_test : RERUN_DURATION;
                 for (int rr = 0; rr < RERUN_COUNT; rr++) {
-                    TestResult rerun = rerun_single(test_funcs[t], seed, RERUN_DURATION);
+                    TestResult rerun = rerun_single(test_funcs[t], seed, rerun_dur);
                     if (!rerun.passed) cr->tests[t].rerun_fails++;
                 }
                 cr->tests[t].confirmed = (cr->tests[t].rerun_fails > 0);
@@ -1148,7 +1199,7 @@ int main(int argc, char **argv) {
         for (int fi = 0; fi < num_fail; fi++) {
             CoreResult *cr = &all[fail_indices[fi]];
             if (cr->tests[T_SCALAR].passed) {
-                for (int t = T_SSE; t < NUM_TESTS; t++) {
+                for (int t = T_SSE3; t < NUM_TESTS; t++) {
                     if (!cr->tests[t].passed && !cr->tests[t].skipped)
                         scalar_ok_simd_fail = true;
                 }
@@ -1169,7 +1220,7 @@ int main(int argc, char **argv) {
         for (int fi = 0; fi < num_fail; fi++) {
             CoreResult *cr = &all[fail_indices[fi]];
             if (!cr->tests[T_XLANE].skipped && !cr->tests[T_XLANE].passed &&
-                cr->tests[T_SCALAR].passed && cr->tests[T_SSE].passed &&
+                cr->tests[T_SCALAR].passed && cr->tests[T_SSE3].passed &&
                 (cr->tests[T_AVX2].passed || cr->tests[T_AVX2].skipped) &&
                 (cr->tests[T_FMA3].passed || cr->tests[T_FMA3].skipped))
                 xlane_only = true;
