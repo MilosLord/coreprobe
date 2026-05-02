@@ -21,11 +21,17 @@
 #define MAX_THREADS 4096
 
 #include <cerrno>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <cstdint>
+#include <vector>
+
+#if !defined(__x86_64__) && !defined(_M_X64) && !defined(__i386__) && !defined(_M_IX86)
+#error "coreprobe requires an x86 or x86-64 target (SSE/AVX/FMA intrinsics)."
+#endif
 #include <immintrin.h>
 
 // Optimization guards - prevent optimization even under -O2/-O3/PGO
@@ -33,7 +39,10 @@
 #ifdef _MSC_VER
     #define COREPROBE_NO_OPTIMIZE  __pragma(optimize("", off))
     #define COREPROBE_RESTORE_OPT  __pragma(optimize("", on))
-#elif defined(__clang__) || defined(__GNUC__)
+#elif defined(__clang__)
+    #define COREPROBE_NO_OPTIMIZE  _Pragma("clang optimize off")
+    #define COREPROBE_RESTORE_OPT  _Pragma("clang optimize on")
+#elif defined(__GNUC__)
     #define COREPROBE_NO_OPTIMIZE  _Pragma("GCC push_options") \
                                   _Pragma("GCC optimize(\"O0\")")
     #define COREPROBE_RESTORE_OPT  _Pragma("GCC pop_options")
@@ -66,9 +75,11 @@
 
     static void platform_init() {
         hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-        DWORD mode;
-        GetConsoleMode(hConsole, &mode);
-        SetConsoleMode(hConsole, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        if (hConsole == INVALID_HANDLE_VALUE || hConsole == NULL) return;
+        DWORD mode = 0;
+        if (GetConsoleMode(hConsole, &mode)) {
+            SetConsoleMode(hConsole, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
     }
 
     static int platform_num_threads() {
@@ -76,7 +87,8 @@
         if (total > 0) return total;
         SYSTEM_INFO si;
         GetSystemInfo(&si);
-        return (int)si.dwNumberOfProcessors;
+        int n = (int)si.dwNumberOfProcessors;
+        return n > 0 ? n : 0;
     }
 
     static bool platform_set_affinity(int thread_id) {
@@ -117,7 +129,8 @@
     static void platform_init() {}
 
     static int platform_num_threads() {
-        return (int)sysconf(_SC_NPROCESSORS_ONLN);
+        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        return n > 0 ? (int)n : 0;
     }
 
     static bool platform_set_affinity(int thread_id) {
@@ -178,20 +191,22 @@ static TopologyInfo detect_topology(int max_threads) {
     DWORD len = 0;
     GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len);
     if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && len > 0) {
-        uint8_t *buf = new uint8_t[len];
+        std::vector<uint8_t> buf(len);
         if (GetLogicalProcessorInformationEx(RelationProcessorCore,
-                (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buf, &len)) {
+                (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buf.data(), &len)) {
             int core_idx = 0;
             DWORD offset = 0;
             while (offset < len) {
-                auto *info = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(buf + offset);
+                auto *info = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(buf.data() + offset);
+                if (info->Size == 0 || offset + info->Size > len) break;
                 if (info->Relationship == RelationProcessorCore) {
                     for (WORD g = 0; g < info->Processor.GroupCount; g++) {
+                        WORD grp = info->Processor.GroupMask[g].Group;
                         KAFFINITY mask = info->Processor.GroupMask[g].Mask;
                         for (int bit = 0; bit < 64; bit++) {
                             if (mask & ((KAFFINITY)1 << bit)) {
-                                int tid = (int)(g * 64 + bit);
-                                if (tid < MAX_THREADS)
+                                int tid = (int)grp * 64 + bit;
+                                if (tid >= 0 && tid < MAX_THREADS)
                                     topo.physical_core[tid] = core_idx;
                             }
                         }
@@ -203,27 +218,28 @@ static TopologyInfo detect_topology(int max_threads) {
             topo.core_count = core_idx;
             topo.valid = true;
         }
-        delete[] buf;
     }
 
     if (topo.valid) {
         DWORD pkg_len = 0;
         GetLogicalProcessorInformationEx(RelationProcessorPackage, NULL, &pkg_len);
         if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && pkg_len > 0) {
-            uint8_t *pbuf = new uint8_t[pkg_len];
+            std::vector<uint8_t> pbuf(pkg_len);
             if (GetLogicalProcessorInformationEx(RelationProcessorPackage,
-                    (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)pbuf, &pkg_len)) {
+                    (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)pbuf.data(), &pkg_len)) {
                 int pkg_idx = 0;
                 DWORD poff = 0;
                 while (poff < pkg_len) {
-                    auto *pi = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(pbuf + poff);
+                    auto *pi = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(pbuf.data() + poff);
+                    if (pi->Size == 0 || poff + pi->Size > pkg_len) break;
                     if (pi->Relationship == RelationProcessorPackage) {
                         for (WORD g = 0; g < pi->Processor.GroupCount; g++) {
+                            WORD grp = pi->Processor.GroupMask[g].Group;
                             KAFFINITY mask = pi->Processor.GroupMask[g].Mask;
                             for (int bit = 0; bit < 64; bit++) {
                                 if (mask & ((KAFFINITY)1 << bit)) {
-                                    int tid = (int)(g * 64 + bit);
-                                    if (tid < MAX_THREADS)
+                                    int tid = (int)grp * 64 + bit;
+                                    if (tid >= 0 && tid < MAX_THREADS)
                                         topo.package_id[tid] = pkg_idx;
                                 }
                             }
@@ -233,7 +249,6 @@ static TopologyInfo detect_topology(int max_threads) {
                     poff += pi->Size;
                 }
             }
-            delete[] pbuf;
         }
     }
 #else
@@ -246,7 +261,7 @@ static TopologyInfo detect_topology(int max_threads) {
                  "/sys/devices/system/cpu/cpu%d/topology/core_id", i);
         FILE *f = fopen(path, "r");
         if (f) {
-            fscanf(f, "%d", &raw[i].core);
+            if (fscanf(f, "%d", &raw[i].core) != 1) ok = false;
             fclose(f);
         } else { ok = false; }
 
@@ -254,7 +269,7 @@ static TopologyInfo detect_topology(int max_threads) {
                  "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", i);
         f = fopen(path, "r");
         if (f) {
-            fscanf(f, "%d", &raw[i].pkg);
+            if (fscanf(f, "%d", &raw[i].pkg) != 1) ok = false;
             fclose(f);
         } else { ok = false; }
         topo.package_id[i] = raw[i].pkg;
@@ -326,14 +341,14 @@ static CPUFeatures detect_cpu() {
     uint32_t r[4];
 
     cpuid(0, 0, r);
+    uint32_t max_basic = r[0];
     memcpy(f.vendor + 0, &r[1], 4);
     memcpy(f.vendor + 4, &r[3], 4);
     memcpy(f.vendor + 8, &r[2], 4);
     f.vendor[12] = 0;
 
-    uint32_t max_ext;
     cpuid(0x80000000, 0, r);
-    max_ext = r[0];
+    uint32_t max_ext = r[0];
     if (max_ext >= 0x80000004) {
         cpuid(0x80000002, 0, r);
         memcpy(f.brand + 0, r, 16);
@@ -347,15 +362,22 @@ static CPUFeatures detect_cpu() {
         if (p != f.brand) memmove(f.brand, p, strlen(p) + 1);
     }
 
-    cpuid(1, 0, r);
-    f.has_sse        = (r[3] & (1 << 25)) != 0;
-    f.has_sse3       = (r[2] & (1 << 0)) != 0;
-    bool has_osxsave = (r[2] & (1 << 27)) != 0;
-    bool cpu_fma3    = (r[2] & (1 << 12)) != 0;
-    bool cpu_avx     = (r[2] & (1 << 28)) != 0;
+    bool has_osxsave = false;
+    bool cpu_fma3 = false, cpu_avx = false;
+    if (max_basic >= 1) {
+        cpuid(1, 0, r);
+        f.has_sse   = (r[3] & (1 << 25)) != 0;
+        f.has_sse3  = (r[2] & (1 << 0)) != 0;
+        has_osxsave = (r[2] & (1 << 27)) != 0;
+        cpu_fma3    = (r[2] & (1 << 12)) != 0;
+        cpu_avx     = (r[2] & (1 << 28)) != 0;
+    }
 
-    cpuid(7, 0, r);
-    bool cpu_avx2 = (r[1] & (1 << 5)) != 0;
+    bool cpu_avx2 = false;
+    if (max_basic >= 7) {
+        cpuid(7, 0, r);
+        cpu_avx2 = (r[1] & (1 << 5)) != 0;
+    }
 
     f.os_avx_enabled = false;
     if (has_osxsave && cpu_avx) {
@@ -441,8 +463,8 @@ static TestResult run_scalar(PRNG &rng, double deadline) {
         volatile float nx = x*il, ny = y*il, nz = z*il, nw = w*il;
         volatile float ck = nx*nx + ny*ny + nz*nz + nw*nw;
         double dev = fabs((double)(float)ck - 1.0);
-        if (dev > r.worst_dev) r.worst_dev = dev;
-        if (dev > TOLERANCE) {
+        if (std::isfinite(dev) && dev > r.worst_dev) r.worst_dev = dev;
+        if (!std::isfinite(dev) || dev > TOLERANCE) {
             r.passed = false; r.worst_dev = dev; r.worst_iter = i;
             r.worst_q[0]=nx; r.worst_q[1]=ny; r.worst_q[2]=nz; r.worst_q[3]=nw;
             r.iterations = i; return r;
@@ -483,8 +505,8 @@ static TestResult run_sse(PRNG &rng, double deadline) {
 
         double da = fabs((double)sse3_dot4(na)-1.0), db = fabs((double)sse3_dot4(nb)-1.0);
         double worst = da>db?da:db;
-        if (worst > r.worst_dev) r.worst_dev = worst;
-        if (worst > TOLERANCE) {
+        if (std::isfinite(worst) && worst > r.worst_dev) r.worst_dev = worst;
+        if (!std::isfinite(da) || !std::isfinite(db) || worst > TOLERANCE) {
             r.passed = false; r.worst_dev = worst; r.worst_iter = i;
             volatile float t[4]; _mm_storeu_ps((float*)t, da>db?na:nb);
             r.worst_q[0]=t[0]; r.worst_q[1]=t[1]; r.worst_q[2]=t[2]; r.worst_q[3]=t[3];
@@ -521,9 +543,9 @@ static TestResult run_avx2(PRNG &rng, double deadline) {
         _mm_store_ss((float*)&c1, _mm256_castps256_ps128(nh2));
         _mm_store_ss((float*)&c2, _mm256_extractf128_ps(nh2,1));
         double d1=fabs((double)(float)c1-1.0), d2=fabs((double)(float)c2-1.0);
-        { double w = d1>d2?d1:d2; if (w > r.worst_dev) r.worst_dev = w; }
+        { double w = d1>d2?d1:d2; if (std::isfinite(w) && w > r.worst_dev) r.worst_dev = w; }
 
-        if (d1>TOLERANCE||d2>TOLERANCE) {
+        if (!std::isfinite(d1) || !std::isfinite(d2) || d1>TOLERANCE || d2>TOLERANCE) {
             r.passed = false; r.worst_dev = d1>d2?d1:d2; r.worst_iter = i;
             volatile float t[8]; _mm256_storeu_ps((float*)t, norm);
             int w = d1>d2?0:4;
@@ -574,8 +596,8 @@ static TestResult run_fma3(PRNG &rng, double deadline) {
 
         double da=fabs((double)fma3_check(na)-1.0), db=fabs((double)fma3_check(nb)-1.0);
         double worst=da>db?da:db;
-        if (worst > r.worst_dev) r.worst_dev = worst;
-        if (worst>TOLERANCE) {
+        if (std::isfinite(worst) && worst > r.worst_dev) r.worst_dev = worst;
+        if (!std::isfinite(da) || !std::isfinite(db) || worst>TOLERANCE) {
             r.passed=false; r.worst_dev=worst; r.worst_iter=i;
             volatile float t[4]; _mm_storeu_ps((float*)t, da>db?na:nb);
             r.worst_q[0]=t[0]; r.worst_q[1]=t[1]; r.worst_q[2]=t[2]; r.worst_q[3]=t[3];
@@ -669,35 +691,125 @@ COREPROBE_RESTORE_OPT
 // Argument parsing
 // ============================================================================
 
-static int parse_threads(int argc, char **argv, int *out, int max_threads) {
+// Parse a base-10 integer; reject empty/malformed/overflow. Returns true on success.
+static bool parse_int(const char *s, int *out) {
+    if (!s || !*s) return false;
+    errno = 0;
+    char *end = nullptr;
+    long v = strtol(s, &end, 10);
+    if (errno != 0 || end == s || (end && *end != '\0')) return false;
+    if (v < INT_MIN || v > INT_MAX) return false;
+    *out = (int)v;
+    return true;
+}
+
+// Parse "lo-hi". The first char must not be '-' (that's a flag).
+static bool parse_range(const char *s, int *lo, int *hi) {
+    const char *dash = strchr(s, '-');
+    if (!dash || dash == s) return false;
+    size_t lo_len = (size_t)(dash - s);
+    char buf[32];
+    if (lo_len == 0 || lo_len >= sizeof(buf)) return false;
+    memcpy(buf, s, lo_len);
+    buf[lo_len] = '\0';
+    if (!parse_int(buf, lo)) return false;
+    if (!parse_int(dash + 1, hi)) return false;
+    return true;
+}
+
+// True if argv[idx] is a flag-value that a prior flag consumed.
+static bool is_flag_value(int idx, int argc, char **argv) {
+    if (idx <= 1) return false;
+    const char *prev = argv[idx - 1];
+    (void)argc;
+    return strcmp(prev, "--socket") == 0 || strcmp(prev, "--repeat") == 0;
+}
+
+// Index of first positional (non-flag, non-flag-value) argument, or -1.
+static int find_first_positional(int argc, char **argv) {
+    for (int a = 1; a < argc; a++) {
+        if (argv[a][0] == '-') continue;
+        if (is_flag_value(a, argc, argv)) continue;
+        return a;
+    }
+    return -1;
+}
+
+static int parse_threads(int argc, char **argv, int *out, int max_threads,
+                         bool *parse_error) {
     bool seen[MAX_THREADS] = {};
     int count = 0;
-    for (int a = 2; a < argc && count < MAX_THREADS; a++) {
-        if (argv[a][0] == '-' && argv[a][1] == '-') {
-            if (strcmp(argv[a], "--socket") == 0 || strcmp(argv[a], "--repeat") == 0) a++;
+    int cap = max_threads < MAX_THREADS ? max_threads : MAX_THREADS;
+    if (cap < 0) cap = 0;
+    if (parse_error) *parse_error = false;
+    int duration_idx = find_first_positional(argc, argv);
+    bool selector_given = false;
+
+    for (int a = 1; a < argc && count < MAX_THREADS; a++) {
+        if (a == duration_idx) continue;
+        if (argv[a][0] == '-') {
+            if (strcmp(argv[a], "--socket") == 0 || strcmp(argv[a], "--repeat") == 0) {
+                if (a + 1 < argc) a++;
+            }
             continue;
         }
-        char *dash = strchr(argv[a], '-');
-        if (dash && dash != argv[a]) {
-            int lo = atoi(argv[a]);
-            int hi = atoi(dash + 1);
+        if (is_flag_value(a, argc, argv)) continue;
+
+        const char *arg = argv[a];
+        selector_given = true;
+        if (strchr(arg, '-')) {
+            int lo = 0, hi = 0;
+            if (!parse_range(arg, &lo, &hi)) {
+                fprintf(stderr, COL_RED "  Error: invalid thread range: %s\n" COL_RESET, arg);
+                if (parse_error) *parse_error = true;
+                return 0;
+            }
+            if (lo > hi) {
+                fprintf(stderr, COL_RED "  Error: inverted thread range: %s\n" COL_RESET, arg);
+                if (parse_error) *parse_error = true;
+                return 0;
+            }
+            if (lo < 0 || hi >= cap) {
+                fprintf(stderr, COL_RED
+                        "  Error: thread range %s outside 0..%d\n" COL_RESET,
+                        arg, cap - 1);
+                if (parse_error) *parse_error = true;
+                return 0;
+            }
             for (int t = lo; t <= hi && count < MAX_THREADS; t++) {
-                if (t >= 0 && t < max_threads && !seen[t]) {
+                if (!seen[t]) {
                     seen[t] = true;
                     out[count++] = t;
                 }
             }
         } else {
-            int t = atoi(argv[a]);
-            if (t >= 0 && t < max_threads && !seen[t]) {
+            int t = 0;
+            if (!parse_int(arg, &t)) {
+                fprintf(stderr, COL_RED "  Error: invalid thread id: %s\n" COL_RESET, arg);
+                if (parse_error) *parse_error = true;
+                return 0;
+            }
+            if (t < 0 || t >= cap) {
+                fprintf(stderr, COL_RED
+                        "  Error: thread id %d outside 0..%d\n" COL_RESET,
+                        t, cap - 1);
+                if (parse_error) *parse_error = true;
+                return 0;
+            }
+            if (!seen[t]) {
                 seen[t] = true;
                 out[count++] = t;
             }
         }
     }
+    if (!selector_given) {
+        for (int i = 0; i < cap; i++) out[i] = i;
+        return cap;
+    }
     if (count == 0) {
-        for (int i = 0; i < max_threads && i < MAX_THREADS; i++) out[i] = i;
-        return max_threads < MAX_THREADS ? max_threads : MAX_THREADS;
+        fprintf(stderr, COL_RED "  Error: no valid threads in selector\n" COL_RESET);
+        if (parse_error) *parse_error = true;
+        return 0;
     }
     return count;
 }
@@ -712,19 +824,43 @@ struct CoreResult {
     TestResult tests[NUM_TESTS];
 };
 
-static void write_json(const char *path, CPUFeatures &cpu, TopologyInfo &topo,
-                       CoreResult *all, int num_results, double wall_time) {
+static void json_escape(const char *in, char *out, size_t out_size) {
+    size_t j = 0;
+    for (size_t i = 0; in[i] != '\0' && j + 2 < out_size; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == '"' || c == '\\') {
+            if (j + 3 >= out_size) break;
+            out[j++] = '\\'; out[j++] = (char)c;
+        } else if (c < 0x20) {
+            if (j + 7 >= out_size) break;
+            int n = snprintf(out + j, out_size - j, "\\u%04x", c);
+            if (n < 0) break;
+            j += (size_t)n;
+        } else {
+            out[j++] = (char)c;
+        }
+    }
+    out[j < out_size ? j : out_size - 1] = '\0';
+}
+
+static bool write_json(const char *path, const CPUFeatures &cpu,
+                       const TopologyInfo &topo, const CoreResult *all,
+                       int num_results, double wall_time) {
     FILE *fp = fopen(path, "w");
     if (!fp) {
         fprintf(stderr, "  Warning: could not write %s\n", path);
-        return;
+        return false;
     }
+
+    char brand_esc[128], vendor_esc[32];
+    json_escape(cpu.brand, brand_esc, sizeof(brand_esc));
+    json_escape(cpu.vendor, vendor_esc, sizeof(vendor_esc));
 
     fprintf(fp, "{\n");
     fprintf(fp, "  \"version\": \"%s\",\n", COREPROBE_VERSION);
     fprintf(fp, "  \"cpu\": {\n");
-    fprintf(fp, "    \"brand\": \"%s\",\n", cpu.brand);
-    fprintf(fp, "    \"vendor\": \"%s\",\n", cpu.vendor);
+    fprintf(fp, "    \"brand\": \"%s\",\n", brand_esc);
+    fprintf(fp, "    \"vendor\": \"%s\",\n", vendor_esc);
     fprintf(fp, "    \"has_sse\": %s,\n", cpu.has_sse ? "true" : "false");
     fprintf(fp, "    \"has_sse3\": %s,\n", cpu.has_sse3 ? "true" : "false");
     fprintf(fp, "    \"has_avx2\": %s,\n", cpu.has_avx2 ? "true" : "false");
@@ -738,15 +874,20 @@ static void write_json(const char *path, CPUFeatures &cpu, TopologyInfo &topo,
     fprintf(fp, "  \"results\": [\n");
 
     for (int i = 0; i < num_results; i++) {
-        CoreResult *cr = &all[i];
+        const CoreResult *cr = &all[i];
+        int phys = 0, pkg = 0;
+        if (cr->thread_id >= 0 && cr->thread_id < MAX_THREADS) {
+            phys = topo.physical_core[cr->thread_id];
+            pkg  = topo.package_id[cr->thread_id];
+        }
         fprintf(fp, "    {\n");
         fprintf(fp, "      \"thread\": %d,\n", cr->thread_id);
-        fprintf(fp, "      \"physical_core\": %d,\n", topo.physical_core[cr->thread_id]);
-        fprintf(fp, "      \"package\": %d,\n", topo.package_id[cr->thread_id]);
+        fprintf(fp, "      \"physical_core\": %d,\n", phys);
+        fprintf(fp, "      \"package\": %d,\n", pkg);
         fprintf(fp, "      \"affinity_ok\": %s,\n", cr->affinity_ok ? "true" : "false");
         fprintf(fp, "      \"tests\": {\n");
         for (int t = 0; t < NUM_TESTS; t++) {
-            TestResult *tr = &cr->tests[t];
+            const TestResult *tr = &cr->tests[t];
             fprintf(fp, "        \"%s\": {\n", tname[t]);
             if (tr->skipped) {
                 fprintf(fp, "          \"status\": \"skipped\"\n");
@@ -774,7 +915,9 @@ static void write_json(const char *path, CPUFeatures &cpu, TopologyInfo &topo,
 
     fprintf(fp, "  ]\n");
     fprintf(fp, "}\n");
-    fclose(fp);
+    bool ok = (ferror(fp) == 0);
+    if (fclose(fp) != 0) ok = false;
+    return ok;
 }
 
 // ============================================================================
@@ -820,22 +963,27 @@ static void print_help(const char *argv0) {
 // Core map
 // ============================================================================
 
-static void print_core_map(CoreResult *all, int num_results, int max_threads,
-                           TopologyInfo &topo) {
-    int *thread_status = new int[max_threads]();
+static void print_core_map(const CoreResult *all, int num_results, int max_threads,
+                           const TopologyInfo &topo) {
+    int cap = max_threads < MAX_THREADS ? max_threads : MAX_THREADS;
+    if (cap < 0) cap = 0;
+    std::vector<int> thread_status(cap, 0);
     for (int i = 0; i < num_results; i++) {
         if (!all[i].affinity_ok) continue;
+        int tid = all[i].thread_id;
+        if (tid < 0 || tid >= cap) continue;
         bool ok = true;
         for (int t = 0; t < NUM_TESTS; t++) {
             if (!all[i].tests[t].passed && !all[i].tests[t].skipped) ok = false;
         }
-        thread_status[all[i].thread_id] = ok ? 1 : 2;
+        thread_status[tid] = ok ? 1 : 2;
     }
 
-    int *core_status = new int[topo.core_count]();
-    for (int tid = 0; tid < max_threads; tid++) {
+    int core_count = topo.core_count > 0 ? topo.core_count : 0;
+    std::vector<int> core_status(core_count, 0);
+    for (int tid = 0; tid < cap; tid++) {
         int phys = topo.physical_core[tid];
-        if (phys >= 0 && phys < topo.core_count) {
+        if (phys >= 0 && phys < core_count) {
             if (thread_status[tid] > core_status[phys])
                 core_status[phys] = thread_status[tid];
         }
@@ -864,9 +1012,6 @@ static void print_core_map(CoreResult *all, int num_results, int max_threads,
     printf(COL_GREEN "[OK]" COL_RESET " = pass  ");
     printf(COL_RED "[XX]" COL_RESET " = FAIL  ");
     printf(COL_GRAY "[--]" COL_RESET " = not tested\n");
-
-    delete[] thread_status;
-    delete[] core_status;
 }
 
 // ============================================================================
@@ -890,31 +1035,63 @@ int main(int argc, char **argv) {
     int  socket_filter = -1;
     int  repeat_count = 1;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--json") == 0) json_output = true;
-        if (strcmp(argv[i], "--soak") == 0) soak_mode = true;
-        if (strcmp(argv[i], "--pause") == 0) pause_at_end = true;
-        if (strcmp(argv[i], "--until-fail") == 0) until_fail = true;
-        if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc)
-            socket_filter = atoi(argv[++i]);
-        if (strcmp(argv[i], "--repeat") == 0 && i + 1 < argc)
-            repeat_count = atoi(argv[++i]);
+        const char *arg = argv[i];
+        if (strcmp(arg, "--json") == 0) { json_output = true; continue; }
+        if (strcmp(arg, "--soak") == 0) { soak_mode = true; continue; }
+        if (strcmp(arg, "--pause") == 0) { pause_at_end = true; continue; }
+        if (strcmp(arg, "--until-fail") == 0) { until_fail = true; continue; }
+        if (strcmp(arg, "--socket") == 0) {
+            if (i + 1 >= argc || !parse_int(argv[i + 1], &socket_filter)) {
+                fprintf(stderr, COL_RED "  Error: --socket requires an integer\n" COL_RESET);
+                return 1;
+            }
+            if (socket_filter < 0) {
+                fprintf(stderr, COL_RED "  Error: --socket must be >= 0\n" COL_RESET);
+                return 1;
+            }
+            i++; continue;
+        }
+        if (strcmp(arg, "--repeat") == 0) {
+            if (i + 1 >= argc || !parse_int(argv[i + 1], &repeat_count)) {
+                fprintf(stderr, COL_RED "  Error: --repeat requires an integer\n" COL_RESET);
+                return 1;
+            }
+            i++; continue;
+        }
+        if (arg[0] == '-') {
+            fprintf(stderr, COL_RED "  Error: unknown flag: %s\n" COL_RESET, arg);
+            return 1;
+        }
     }
     if (repeat_count < 1) repeat_count = 1;
     if (until_fail) repeat_count = INT32_MAX;
 
     int max_threads = platform_num_threads();
+    if (max_threads <= 0) {
+        fprintf(stderr, COL_RED "  Error: could not determine CPU count\n" COL_RESET);
+        return 1;
+    }
+    if (max_threads > MAX_THREADS) max_threads = MAX_THREADS;
     CPUFeatures cpu = detect_cpu();
     TopologyInfo topo = detect_topology(max_threads);
 
-    int total_seconds = 120;
-    if (soak_mode) total_seconds = 600;
-    if (argc > 1 && argv[1][0] != '-') {
-        total_seconds = atoi(argv[1]);
-        if (total_seconds <= 0) total_seconds = 120;
+    int total_seconds = soak_mode ? 600 : 120;
+    int duration_idx = find_first_positional(argc, argv);
+    if (duration_idx > 0) {
+        int parsed = 0;
+        if (!parse_int(argv[duration_idx], &parsed) || parsed <= 0) {
+            fprintf(stderr, COL_RED "  Error: invalid duration: %s\n" COL_RESET,
+                    argv[duration_idx]);
+            return 1;
+        }
+        total_seconds = parsed;
     }
 
     int thread_list[MAX_THREADS];
-    int num_threads = parse_threads(argc, argv, thread_list, max_threads);
+    bool thread_parse_error = false;
+    int num_threads = parse_threads(argc, argv, thread_list, max_threads,
+                                    &thread_parse_error);
+    if (thread_parse_error) return 1;
 
     if (socket_filter >= 0) {
         if (!topo.valid) {
@@ -1016,7 +1193,8 @@ int main(int argc, char **argv) {
                    "---", "--------", "--------", "--------", "--------", "--------", "------");
         }
 
-    CoreResult *all = new CoreResult[num_threads]();
+    std::vector<CoreResult> all(num_threads);
+    int affinity_fails = 0;
     double wall_start = now_sec();
 
     for (int ci = 0; ci < num_threads; ci++) {
@@ -1026,6 +1204,7 @@ int main(int argc, char **argv) {
 
         if (!platform_set_affinity(tid)) {
             cr->affinity_ok = false;
+            affinity_fails++;
             printf("  " COL_RED "T%-3d  affinity FAILED, skipping" COL_RESET "\n", tid);
             continue;
         }
@@ -1152,16 +1331,17 @@ int main(int argc, char **argv) {
         printf(COL_RED "  *** FPU ERRORS DETECTED ***" COL_RESET "\n\n");
 
         for (int fi = 0; fi < num_fail; fi++) {
-            CoreResult *cr = &all[fail_indices[fi]];
-            int phys = topo.physical_core[cr->thread_id];
-            int pkg  = topo.package_id[cr->thread_id];
+            const CoreResult *cr = &all[fail_indices[fi]];
+            int tid = cr->thread_id;
+            int phys = (tid >= 0 && tid < MAX_THREADS) ? topo.physical_core[tid] : -1;
+            int pkg  = (tid >= 0 && tid < MAX_THREADS) ? topo.package_id[tid]    : -1;
 
             printf("  Thread %d (physical core %d, package %d%s):\n",
                    cr->thread_id, phys, pkg,
                    topo.valid ? "" : ", heuristic");
 
             for (int t = 0; t < NUM_TESTS; t++) {
-                TestResult *tr = &cr->tests[t];
+                const TestResult *tr = &cr->tests[t];
                 if (tr->skipped) continue;
                 if (!tr->passed) {
                     printf("    " COL_RED "%s FAILED" COL_RESET, tname[t]);
@@ -1185,19 +1365,21 @@ int main(int argc, char **argv) {
 
         printf("  " COL_MAGENTA "Diagnosis:" COL_RESET "\n");
         printf("  Affected physical core(s): ");
-        bool seen[MAX_THREADS] = {};
+        std::vector<bool> seen_core(topo.core_count > 0 ? topo.core_count : 0, false);
         for (int fi = 0; fi < num_fail; fi++) {
-            int phys = topo.physical_core[all[fail_indices[fi]].thread_id];
-            if (!seen[phys]) {
+            int tid = all[fail_indices[fi]].thread_id;
+            if (tid < 0 || tid >= MAX_THREADS) continue;
+            int phys = topo.physical_core[tid];
+            if (phys >= 0 && phys < (int)seen_core.size() && !seen_core[phys]) {
                 printf(COL_RED "Core %d " COL_RESET, phys);
-                seen[phys] = true;
+                seen_core[phys] = true;
             }
         }
         printf("\n");
 
         bool scalar_ok_simd_fail = false;
         for (int fi = 0; fi < num_fail; fi++) {
-            CoreResult *cr = &all[fail_indices[fi]];
+            const CoreResult *cr = &all[fail_indices[fi]];
             if (cr->tests[T_SCALAR].passed) {
                 for (int t = T_SSE3; t < NUM_TESTS; t++) {
                     if (!cr->tests[t].passed && !cr->tests[t].skipped)
@@ -1218,7 +1400,7 @@ int main(int argc, char **argv) {
 
         bool xlane_only = false;
         for (int fi = 0; fi < num_fail; fi++) {
-            CoreResult *cr = &all[fail_indices[fi]];
+            const CoreResult *cr = &all[fail_indices[fi]];
             if (!cr->tests[T_XLANE].skipped && !cr->tests[T_XLANE].passed &&
                 cr->tests[T_SCALAR].passed && cr->tests[T_SSE3].passed &&
                 (cr->tests[T_AVX2].passed || cr->tests[T_AVX2].skipped) &&
@@ -1235,25 +1417,35 @@ int main(int argc, char **argv) {
             printf("\n  " COL_RED "Confirmed failures reproduce with identical seeds." COL_RESET "\n");
             printf("  " COL_RED "This is a hardware defect, not a transient error." COL_RESET "\n");
         }
+    } else if (affinity_fails == num_threads) {
+        printf(COL_RED "  *** No tests ran: affinity failed on every requested thread ***" COL_RESET "\n");
     } else {
         printf(COL_GREEN "  ALL TESTS PASSED -no FPU/SIMD errors detected." COL_RESET "\n");
+        if (affinity_fails > 0) {
+            printf(COL_YELLOW "  Note: %d thread(s) skipped due to affinity failures." COL_RESET "\n",
+                   affinity_fails);
+        }
     }
 
     printf("\n");
 
-    print_core_map(all, num_threads, max_threads, topo);
+    print_core_map(all.data(), num_threads, max_threads, topo);
 
     printf("\n  Wall time: %.1f seconds\n", wall_end - wall_start);
 
     if (json_output) {
-        write_json("coreprobe_results.json", cpu, topo, all, num_threads, wall_end - wall_start);
-        printf("  Results written to: coreprobe_results.json\n");
+        if (write_json("coreprobe_results.json", cpu, topo, all.data(),
+                       num_threads, wall_end - wall_start)) {
+            printf("  Results written to: coreprobe_results.json\n");
+        } else {
+            printf(COL_YELLOW "  Warning: JSON write encountered errors" COL_RESET "\n");
+        }
     }
 
     printf("\n");
 
-    delete[] all;
     overall_fails += total_fails;
+    if (affinity_fails == num_threads) overall_fails = overall_fails > 0 ? overall_fails : 1;
 
     if (total_fails > 0) break;
     if (repeat_count > 1 && pass + 1 < repeat_count) {
