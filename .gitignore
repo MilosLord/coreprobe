@@ -6,7 +6,9 @@
 *.ilk
 *.exp
 *.lib
+*.dll
 *.json
 .vs/
+coreprobe
 credentials.txt
 CLAUDE_universal.md

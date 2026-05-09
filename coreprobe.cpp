@@ -108,6 +108,10 @@ static bool platform_set_affinity(int thread_id)
     ga.Mask           = static_cast<KAFFINITY>(1) << (thread_id % 64);
     if (!SetThreadGroupAffinity(GetCurrentThread(), &ga, nullptr)) return false;
     Sleep(0);
+    PROCESSOR_NUMBER pn = {};
+    GetCurrentProcessorNumberEx(&pn);
+    int actual = static_cast<int>(pn.Group) * 64 + static_cast<int>(pn.Number);
+    if (actual != thread_id) return false;
     return true;
 }
 
@@ -1687,6 +1691,8 @@ static bool run_thread_tests(CoreResult& cr, int tid, int pass,
 
     for (int t = 0; t < NUM_TESTS; t++)
     {
+        if (g_stop) break;
+
         if (should_skip_test(t, cpu))
         {
             cr.tests[t].skipped = true;
@@ -1807,7 +1813,7 @@ int main(int argc, char** argv)
     int overall_fails = 0;
     int pass_number   = 0;
 
-    for (int pass = 0; pass < cfg.repeat_count; pass++)
+    for (int pass = 0; pass < cfg.repeat_count && !g_stop; pass++)
     {
         pass_number = pass + 1;
         if (cfg.repeat_count > 1)
@@ -1821,7 +1827,7 @@ int main(int argc, char** argv)
         int    affinity_fails = 0;
         double wall_start     = now_sec();
 
-        for (int ci = 0; ci < cfg.num_threads; ci++)
+        for (int ci = 0; ci < cfg.num_threads && !g_stop; ci++)
         {
             int tid = cfg.thread_list[static_cast<size_t>(ci)];
             all[static_cast<size_t>(ci)].thread_id = tid;
@@ -1839,7 +1845,9 @@ int main(int argc, char** argv)
             printf("  Pass %d complete -no errors. Continuing...\n", pass_number);
     }
 
-    if (cfg.repeat_count > 1 && overall_fails == 0)
+    if (g_stop)
+        printf(COL_YELLOW "\n  Interrupted by user." COL_RESET "\n");
+    else if (cfg.repeat_count > 1 && overall_fails == 0)
         printf(COL_GREEN "\n  All %d passes completed with no failures." COL_RESET "\n", pass_number);
 
     if (cfg.pause_at_end)
