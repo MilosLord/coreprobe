@@ -9,3 +9,4 @@
 *.json
 .vs/
 credentials.txt
+CLAUDE_universal.md

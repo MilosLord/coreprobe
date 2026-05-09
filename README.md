@@ -11,7 +11,7 @@ Developed after discovering a Ryzen 9 5950X with a single core whose SIMD units 
 | Test | Instruction Path | What It Catches | Comparison |
 |------|-----------------|-----------------|------------|
 | `SCALAR` | Scalar `1/sqrt` | Basic FPU errors | Tolerance |
-| `SSE` | 128-bit `rsqrt+NR` / `sqrt+div` | SSE pipeline faults | Tolerance |
+| `SSE3` | 128-bit `rsqrt+NR` / `sqrt+div` | SSE3 pipeline faults | Tolerance |
 | `AVX2` | 256-bit `sqrt+div` | AVX2 execution unit errors | Tolerance |
 | `FMA3` | FMA `rsqrt+NR` / `sqrt+div` | Fused multiply-add faults | Tolerance |
 | `XLANE` | `vperm2f128`, `vpermd` | Cross-lane data corruption | Bit-exact |
@@ -22,20 +22,22 @@ The **XLANE** test specifically targets the 128-bit lane boundary in AVX2 regist
 
 MinGW:
 ```
-g++ -O0 -mavx2 -mfma -std=c++17 -o coreprobe.exe coreprobe.cpp
+g++ -O0 -std=c++20 -o coreprobe.exe coreprobe.cpp
 ```
 
 MSVC:
 ```
-cl /Od /arch:AVX2 /std:c++17 /EHsc coreprobe.cpp /Fe:coreprobe.exe
+cl /Od /std:c++20 /EHsc coreprobe.cpp /Fe:coreprobe.exe
 ```
 
 Linux:
 ```
-g++ -O0 -mavx2 -mfma -std=c++17 -lpthread -o coreprobe coreprobe.cpp
+g++ -O0 -std=c++20 -lpthread -o coreprobe coreprobe.cpp
 ```
 
 > **`-O0` / `/Od` is intentional.** This is an arithmetic correctness test, not a throughput benchmark. Optimizations can mask hardware faults by reordering or eliminating floating-point operations.
+>
+> **No global `-mavx2 -mfma` / `/arch:AVX2` needed.** GCC/Clang use per-function `target()` attributes for SIMD dispatch; MSVC makes AVX/FMA intrinsics available without `/arch:` flags. The binary runs on any x86-64 CPU and skips unsupported tests at runtime.
 
 ## Usage
 
@@ -45,10 +47,10 @@ coreprobe [seconds] [threads...] [flags]
 
 | Example | Description |
 |---------|-------------|
-| `coreprobe` | All threads, 120 seconds |
-| `coreprobe 60` | All threads, 60 seconds |
+| `coreprobe` | All threads, 120s target (actual may be longer, min 2s/test) |
+| `coreprobe 60` | All threads, 60s target |
 | `coreprobe 20 4` | Thread 4 only, 20 seconds |
-| `coreprobe 60 0-15` | Threads 0-15, 60 seconds |
+| `coreprobe 60 0-15` | Threads 0-15, 60s target (actual may be longer, min 2s/test) |
 | `coreprobe --soak` | Extended 10-minute soak test |
 | `coreprobe --socket 0` | Only threads on socket 0 |
 | `coreprobe --repeat 5` | Run 5 full passes |
