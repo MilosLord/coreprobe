@@ -1,0 +1,165 @@
+Language:        Cpp
+BasedOnStyle:    LLVM
+Standard:        Latest
+
+IndentWidth:                    4
+TabWidth:                       4
+UseTab:                         Never
+ContinuationIndentWidth:        4
+ConstructorInitializerIndentWidth: 4
+AccessModifierOffset:           -4
+NamespaceIndentation:           None
+IndentCaseLabels:               true
+IndentCaseBlocks:               false
+IndentPPDirectives:             None
+IndentWrappedFunctionNames:     false
+IndentExternBlock:              AfterExternBlock
+LambdaBodyIndentation:          Signature
+
+BreakBeforeBraces:              Custom
+BraceWrapping:
+    AfterCaseLabel:             true
+    AfterClass:                 true
+    AfterControlStatement:      Always
+    AfterEnum:                  true
+    AfterFunction:              true
+    AfterNamespace:             true
+    AfterStruct:                true
+    AfterUnion:                 true
+    AfterExternBlock:           true
+    BeforeCatch:                true
+    BeforeElse:                 false
+    BeforeLambdaBody:           false
+    BeforeWhile:                true
+    IndentBraces:               false
+    SplitEmptyFunction:         false
+    SplitEmptyRecord:           false
+    SplitEmptyNamespace:        false
+
+ColumnLimit:                    120
+ReflowComments:                 false
+BreakStringLiterals:            true
+
+PointerAlignment:               Left
+ReferenceAlignment:             Left
+DerivePointerAlignment:         false
+QualifierAlignment:             Leave
+
+AllowShortIfStatementsOnASingleLine:   AllIfsAndElse
+AllowShortLoopsOnASingleLine:          true
+AllowShortFunctionsOnASingleLine:      All
+AllowShortBlocksOnASingleLine:         Always
+AllowShortCaseLabelsOnASingleLine:     true
+AllowShortLambdasOnASingleLine:        All
+AllowShortEnumsOnASingleLine:          false
+AllowShortCompoundRequirementOnASingleLine: true
+
+AlignAfterOpenBracket:          Align
+AlignOperands:                  Align
+AlignEscapedNewlines:           Left
+AlignArrayOfStructures:         Left
+AlignConsecutiveAssignments:
+    Enabled:         true
+    AcrossEmptyLines: false
+    AcrossComments:  false
+    AlignCompound:   true
+    PadOperators:    true
+AlignConsecutiveDeclarations:
+    Enabled:         true
+    AcrossEmptyLines: false
+    AcrossComments:  false
+AlignConsecutiveMacros:
+    Enabled:         true
+    AcrossEmptyLines: false
+    AcrossComments:  false
+AlignConsecutiveBitFields:
+    Enabled:         true
+    AcrossEmptyLines: false
+    AcrossComments:  false
+AlignTrailingComments:
+    Kind:           Always
+    OverEmptyLines: 0
+
+SpaceBeforeParens:                       ControlStatements
+SpaceAfterCStyleCast:                    true
+SpaceAfterLogicalNot:                    false
+SpaceAfterTemplateKeyword:               true
+SpaceBeforeAssignmentOperators:          true
+SpaceBeforeCaseColon:                    false
+SpaceBeforeCpp11BracedList:              false
+SpaceBeforeCtorInitializerColon:         true
+SpaceBeforeInheritanceColon:             true
+SpaceBeforeRangeBasedForLoopColon:       true
+SpaceBeforeSquareBrackets:               false
+SpaceInEmptyBlock:                       false
+SpaceInEmptyParentheses:                 false
+SpacesBeforeTrailingComments:            1
+SpacesInAngles:                          Never
+SpacesInCStyleCastParentheses:           false
+SpacesInConditionalStatement:            false
+SpacesInContainerLiterals:               false
+SpacesInParentheses:                     false
+SpacesInSquareBrackets:                  false
+BitFieldColonSpacing:                    Both
+
+SortIncludes:                   CaseSensitive
+SortUsingDeclarations:          true
+IncludeBlocks:                  Regroup
+IncludeCategories:
+    - Regex:    '^".*"'
+      Priority: 1
+    - Regex:    '^<[[:alnum:]_]+>'
+      Priority: 2
+    - Regex:    '^<.*\.(h|hpp|hxx)>'
+      Priority: 3
+IncludeIsMainRegex:             '(Test)?$'
+
+AllowAllArgumentsOnNextLine:               true
+AllowAllParametersOfDeclarationOnNextLine: true
+BinPackArguments:                          false
+BinPackParameters:                         false
+BreakBeforeBinaryOperators:                None
+BreakBeforeConceptDeclarations:            Always
+BreakTemplateDeclarations:                 Yes
+BreakBeforeTernaryOperators:               true
+BreakConstructorInitializers:              BeforeColon
+BreakInheritanceList:                      BeforeColon
+PackConstructorInitializers:               Never
+
+PenaltyBreakAssignment:                    2
+PenaltyBreakBeforeFirstCallParameter:      19
+PenaltyBreakComment:                       300
+PenaltyBreakFirstLessLess:                 120
+PenaltyBreakOpenParenthesis:               0
+PenaltyBreakString:                        1000
+PenaltyBreakTemplateDeclaration:           10
+PenaltyExcessCharacter:                    1000000
+PenaltyIndentedWhitespace:                 0
+PenaltyReturnTypeOnItsOwnLine:             60
+
+MaxEmptyLinesToKeep:                 1
+KeepEmptyLinesAtTheStartOfBlocks:    false
+EmptyLineBeforeAccessModifier:       LogicalBlock
+EmptyLineAfterAccessModifier:        Never
+SeparateDefinitionBlocks:            Leave
+
+FixNamespaceComments:           true
+Cpp11BracedListStyle:           true
+CompactNamespaces:              false
+
+# C++20/23
+RequiresClausePosition:         OwnLine
+RequiresExpressionIndentation:  OuterScope
+
+IntegerLiteralSeparator:
+    Binary:          4
+    Decimal:         3
+    Hex:             2
+    DecimalMinDigits: 5
+    BinaryMinDigits:  9
+    HexMinDigits:     5
+
+RemoveSemicolon:                true
+RemoveParentheses:              ReturnStatement
+InsertNewlineAtEOF:             true
+InsertTrailingCommas:           Wrapped

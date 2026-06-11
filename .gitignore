@@ -1,3 +1,4 @@
+coreprobe
 *.exe
 *.o
 *.obj
@@ -7,8 +8,14 @@
 *.exp
 *.lib
 *.dll
+*.tmp
 *.json
+
+build*/
+scan-build-report/
 .vs/
-coreprobe
+.cache/
+.clangd
+
 credentials.txt
 CLAUDE_universal.md

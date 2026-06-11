@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  linux-gcc:
+    name: Linux GCC (strict)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build
+        run: >
+          g++ -O0 -std=c++20
+          -Wall -Wextra -Wpedantic -Wold-style-cast -Wsign-conversion -Wdouble-promotion
+          -Werror -pthread -o coreprobe coreprobe.cpp
+
+      - name: Smoke test
+        run: |
+          ./coreprobe --version
+          ./coreprobe --help
+          ./coreprobe 1 0 --json
+          python3 -m json.tool coreprobe_results.json > /dev/null
+
+      - name: Usage errors exit with code 2
+        run: |
+          set +e
+          ./coreprobe --nope
+          [ $? -eq 2 ] || { echo "unknown flag should exit 2"; exit 1; }
+          ./coreprobe abc
+          [ $? -eq 2 ] || { echo "bad duration should exit 2"; exit 1; }
+          ./coreprobe 20 9999
+          [ $? -eq 2 ] || { echo "bad thread id should exit 2"; exit 1; }
+          exit 0
+
+  windows-msvc:
+    name: Windows MSVC (/W4 /WX)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build
+        run: cl /nologo /Od /std:c++20 /EHsc /W4 /WX /D_CRT_SECURE_NO_WARNINGS coreprobe.cpp /Fe:coreprobe.exe
+
+      - name: Smoke test
+        run: |
+          .\coreprobe.exe --version
+          .\coreprobe.exe 1 0 --json
+          python -m json.tool coreprobe_results.json
+
+  clang-tidy:
+    name: clang-tidy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Run clang-tidy
+        run: clang-tidy coreprobe.cpp -- -std=c++20
